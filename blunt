@@ -1,0 +1,317 @@
+#!/bin/bash
+#
+# Summarized Failed Login Scanner for Arch Linux
+# Shows a daily summary of failed login attempts per user
+#
+
+# Default configuration
+LOG_FILES=("/var/log/auth.log" "/var/log/secure")
+USERNAME=""          # Specific username to monitor (empty = all users)
+OUTPUT_FILE=""       # File to write results to (empty = stdout)
+DAYS_BACK=0          # Number of days back to scan (0 = all time)
+
+# Display usage information
+show_usage() {
+    echo "Summarized Failed Login Scanner for Arch Linux"
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  -f, --files FILES      Comma-separated list of log files to scan"
+    echo "  -u, --user USERNAME    Specific username to monitor (default: all users)"
+    echo "  -d, --days DAYS        Number of days back to scan (default: all time)"
+    echo "  -o, --output FILE      Write results to file instead of stdout"
+    echo "  -h, --help             Show this help message"
+    echo ""
+    echo "Example:"
+    echo "  $0 -u root -d 7 -o /var/log/failed_logins.log"
+    echo ""
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--files)
+            IFS=',' read -ra LOG_FILES <<< "$2"
+            shift 2
+            ;;
+        -u|--user)
+            USERNAME="$2"
+            shift 2
+            ;;
+        -d|--days)
+            DAYS_BACK="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+# Function to set up output (file or stdout)
+setup_output() {
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        # Create directory if it doesn't exist
+        mkdir -p "$(dirname "$OUTPUT_FILE")" 2>/dev/null
+        # Create or truncate the file
+        > "$OUTPUT_FILE"
+        log "Output will be written to: $OUTPUT_FILE"
+    fi
+}
+
+# Function to log messages
+log() {
+    local message="$1"
+    
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        echo "$message" >> "$OUTPUT_FILE"
+    else
+        echo "$message"
+    fi
+}
+
+# Function to quickly scan for failed logins with summarized output
+scan_summarized_logins() {
+    # Create temp files
+    local temp_results=$(mktemp)
+    local temp_summary=$(mktemp)
+    local temp_user_ip=$(mktemp)
+    local temp_all_ips=$(mktemp)
+    
+    # Counter for total attempts
+    local total_attempts=0
+    
+    log "Starting scan for failed login attempts..."
+    
+    # Build date filter for grep if days_back is specified
+    local date_filter=""
+    if [[ $DAYS_BACK -gt 0 ]]; then
+        log "Scanning logs from the last $DAYS_BACK days"
+        
+        # Create a simple date list for the past N days
+        for i in $(seq 0 $DAYS_BACK); do
+            if [[ $i -gt 0 && -n "$date_filter" ]]; then
+                date_filter="$date_filter|"
+            fi
+            # Add date in both formats (Jan  1 and Jan 01)
+            local d1=$(date -d "$i days ago" +"%b %_d")
+            local d2=$(date -d "$i days ago" +"%b %d")
+            date_filter="${date_filter}$d1|$d2"
+        done
+        
+        if [[ -n "$date_filter" ]]; then
+            date_filter="($date_filter)"
+        fi
+    else
+        log "Scanning all available logs"
+    fi
+    
+    # Process auth.log and secure files - specifically targeting failed password attempts
+    for log_file in "${LOG_FILES[@]}"; do
+        if [[ -f "$log_file" ]]; then
+            log "Scanning $log_file for failed logins..."
+            
+            # First, quickly extract just what we need with specific grep patterns
+            if [[ -n "$USERNAME" ]]; then
+                # Filter for specific username
+                if [[ -n "$date_filter" ]]; then
+                    grep -E "$date_filter" "$log_file" | grep -E "Failed password|authentication failure|Invalid user" | grep -i "$USERNAME" >> "$temp_results"
+                else
+                    grep -E "Failed password|authentication failure|Invalid user" "$log_file" | grep -i "$USERNAME" >> "$temp_results"
+                fi
+            else
+                # All users
+                if [[ -n "$date_filter" ]]; then
+                    grep -E "$date_filter" "$log_file" | grep -E "Failed password|authentication failure|Invalid user" >> "$temp_results"
+                else
+                    grep -E "Failed password|authentication failure|Invalid user" "$log_file" >> "$temp_results"
+                fi
+            fi
+        fi
+    done
+    
+    # Process journalctl for systems using systemd
+    if command -v journalctl &> /dev/null; then
+        log "Scanning journalctl for failed logins..."
+        
+        local journal_cmd="journalctl --no-pager -g \"Failed password|authentication failure|Invalid user\""
+        
+        if [[ $DAYS_BACK -gt 0 ]]; then
+            journal_cmd="$journal_cmd --since=\"$DAYS_BACK days ago\""
+        fi
+        
+        if [[ -n "$USERNAME" ]]; then
+            journal_cmd="$journal_cmd | grep -i \"$USERNAME\""
+        fi
+        
+        eval "$journal_cmd" >> "$temp_results"
+    fi
+    
+    # Process the results to create a summary by day and user
+    log ""
+    log "Scanning logs for failed login attempts..."
+    
+    local last_user_ip=""
+    
+    while IFS= read -r line; do
+        # Extract date (just day, not time)
+        local date=$(echo "$line" | grep -oE "[A-Za-z]{3} [0-9]{1,2}" | head -1)
+        
+        # Extract username (try different patterns)
+        local username=""
+        username=$(echo "$line" | grep -oE "user=[a-zA-Z0-9_-]+" | cut -d= -f2)
+        
+        if [[ -z "$username" ]]; then
+            username=$(echo "$line" | grep -oE "user [a-zA-Z0-9_-]+" | cut -d' ' -f2)
+        fi
+        
+        if [[ -z "$username" ]]; then
+            username=$(echo "$line" | grep -oE "for [a-zA-Z0-9_-]+ from" | cut -d' ' -f2)
+        fi
+        
+        if [[ -z "$username" ]]; then
+            username=$(echo "$line" | grep -oE "for invalid user [a-zA-Z0-9_-]+" | cut -d' ' -f4)
+        fi
+        
+        if [[ -z "$username" ]]; then
+            # If we still can't find username, just use "unknown"
+            username="unknown"
+        fi
+        
+        # Try to extract password if available in the log
+        # Note: Most secure systems don't log attempted passwords, but some do
+        local password=""
+        password=$(echo "$line" | grep -oE "password:[[:space:]]*[^[:space:]]*" | cut -d' ' -f2)
+        
+        if [[ -z "$password" ]]; then
+            password=$(echo "$line" | grep -oE "with password \"[^\"]*\"" | cut -d'"' -f2)
+        fi
+        
+        if [[ -z "$password" ]]; then
+            password=$(echo "$line" | grep -oE "password [^[:space:]]*" | cut -d' ' -f2)
+        fi
+        
+        # Extract IP address
+        local ip=$(echo "$line" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | head -1)
+        if [[ -z "$ip" ]]; then
+            ip="unknown"
+        fi
+        
+        # Add IP to the all IPs list if it's not "unknown"
+        if [[ "$ip" != "unknown" ]]; then
+            echo "$ip" >> "$temp_all_ips"
+        fi
+        
+        # Create a user-ip string for deduplication
+        local user_ip="$username-$ip"
+        
+        # Add to summary and display progress (only showing each user-IP combo once)
+        if [[ -n "$date" && -n "$username" && "$user_ip" != "$last_user_ip" ]]; then
+            if [[ -n "$password" ]]; then
+                log "$username - ($ip) - password: \"$password\" - found"
+            else
+                log "$username - ($ip) - password: [not logged] - found"
+            fi
+            last_user_ip="$user_ip"
+            
+            total_attempts=$((total_attempts + 1))
+            echo "$date:$username" >> "$temp_summary"
+            
+            # Save user-IP mapping for summary
+            if [[ -n "$ip" && "$ip" != "unknown" ]]; then
+                echo "$username $ip" >> "$temp_user_ip"
+            fi
+        elif [[ -n "$date" && -n "$username" ]]; then
+            # Still count it but don't show duplicate progress messages
+            total_attempts=$((total_attempts + 1))
+            echo "$date:$username" >> "$temp_summary"
+            
+            # Save user-IP mapping for summary
+            if [[ -n "$ip" && "$ip" != "unknown" ]]; then
+                echo "$username $ip" >> "$temp_user_ip"
+            fi
+        fi
+    done < "$temp_results"
+    
+    # Display daily summary
+    log ""
+    log "==================== Failed Login Summary ===================="
+    
+    # Sort by date and user, then count occurrences
+    if [[ -s "$temp_summary" ]]; then
+        sort "$temp_summary" | uniq -c | while read -r count dateuser; do
+            IFS=':' read -r date user <<< "$dateuser"
+            log "$date - User: $user - Failed attempts: $count"
+        done
+    else
+        log "No failed login attempts found."
+    fi
+    
+    # Display overall summary
+    log ""
+    log "==================== Overall Summary ===================="
+    log "Total failed login attempts: $total_attempts"
+    
+    # Show user summary (total attempts per user)
+    if [[ -s "$temp_summary" && $total_attempts -gt 0 ]]; then
+        log ""
+        log "Attempts by user:"
+        log "----------------"
+        
+        cut -d':' -f2 < "$temp_summary" | sort | uniq -c | sort -nr | while read -r count user; do
+            log "User: $user - $count attempts"
+        done
+    fi
+    
+    # Show main IP per user
+    if [[ -s "$temp_user_ip" && $total_attempts -gt 0 ]]; then
+        log ""
+        log "Main IP address per user:"
+        log "-------------------------"
+        
+        for user in $(cat "$temp_user_ip" | cut -d' ' -f1 | sort -u); do
+            # Find the most common IP for this user
+            local main_ip=$(grep "^$user " "$temp_user_ip" | cut -d' ' -f2 | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+            local count=$(grep "^$user " "$temp_user_ip" | wc -l)
+            
+            if [[ -n "$main_ip" ]]; then
+                log "User: $user - Main IP: $main_ip ($count attempts)"
+            fi
+        done
+    fi
+    
+    # Output a complete list of all attacker IPs found
+    if [[ -s "$temp_all_ips" ]]; then
+        log ""
+        log "==================== ALL ATTACKING IP ADDRESSES ===================="
+        log "The following IP addresses were found attempting to login to your system:"
+        sort "$temp_all_ips" | uniq | while read -r ip; do
+            log "$ip"
+        done
+        log ""
+        log "Copy-paste friendly format (for blocking):"
+        sort "$temp_all_ips" | uniq | tr '\n' ' '
+        log ""
+    fi
+    
+    # Clean up
+    rm -f "$temp_results" "$temp_summary" "$temp_user_ip" "$temp_all_ips"
+    
+    log ""
+    log "Scan completed."
+}
+
+# Main execution
+setup_output
+scan_summarized_logins
+exit 0
