@@ -1,2 +1,2 @@
 # blunt
-blunt force log scanner for arch servers.  written is python
+blunt force log scanner for arch servers.  written in bash
